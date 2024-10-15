@@ -30,7 +30,7 @@ namespace Oxide.Plugins
         private Dictionary<ulong, string> jailReasons = new Dictionary<ulong, string>(); // To store jail reasons
         private Dictionary<ulong, Vector3> previousLocations = new Dictionary<ulong, Vector3>(); // Save player's previous locations
 
-        private const string SubfolderName = "Jails";
+        private const string SubfolderName = "Jail";
 
         private StoredData storedData;
 
@@ -330,10 +330,7 @@ namespace Oxide.Plugins
             var player = info?.Initiator as BasePlayer;
             if (player != null && jailedPlayers.Contains(player.userID))
             {
-                if (info?.Weapon != null) // If the player is using a weapon
-                {
-                    return true; // Cancel damage, effectively blocking weapon use
-                }
+                return true; // Prevents the attacked player from taking damage
             }
             return null;
         }
@@ -396,6 +393,20 @@ namespace Oxide.Plugins
         #endregion Hooks
 
         #region Jail Management
+        private void JailOfflinePlayer(ulong playerId, TimeSpan? jailTime = null, string reason = "No reason provided")
+        {
+            var releaseTime = jailTime.HasValue ? DateTime.UtcNow.Add(jailTime.Value) : DateTime.UtcNow.Add(TimeSpan.FromMinutes(configData.defaultJailTime));
+            // Store offline player's jail data
+            storedData.jailedPlayers.Add(new JailedPlayer
+            {
+                playerId = playerId,
+                releaseTime = releaseTime,
+                jailReason = reason
+            });
+            TimeSpan remainingTime = releaseTime - DateTime.UtcNow;
+            remainingJailTimes[playerId] = remainingTime;
+            SaveData();
+        }
 
         private void RestoreJailTimers()
         {
@@ -659,7 +670,7 @@ namespace Oxide.Plugins
             // Jail UI Message
             elements.Add(new CuiLabel
             {
-                Text = { Text = $"You are jailed for: {reason}\nTime remaining: {remainingTime.TotalMinutes:F2} minutes\nRead the server rules: {configData.RulesUrl}", FontSize = 22, Align = TextAnchor.MiddleCenter },
+                Text = { Text = $"You were jailed for: {reason}\nTime remaining: {remainingTime.TotalMinutes:F2} minutes\nA Staff member will come talk to you. While you are waiting please read the rules at: {configData.RulesUrl}", FontSize = 22, Align = TextAnchor.MiddleCenter },
                 RectTransform = { AnchorMin = "0.1 0.3", AnchorMax = "0.9 0.7" }
             }, panel);
 
@@ -695,9 +706,9 @@ namespace Oxide.Plugins
             if (args.Length < 1)
             {
                 player.ChatMessage("[<color=#FF4F4B>Jail</color>]\n");
-                player.ChatMessage("/jail send <playername/id> [minutes] [reason:optional] - Send to Jail\n");
+                player.ChatMessage("/jail send <playername/id> [minutes:optional:15m] [reason:optional] - Send to Jail\n");
                 player.ChatMessage("/jail free <playername/id> - Release from Jail\n");
-                player.ChatMessage("/jail extend <playername/id> [minutes] - Extend Jail Time\n");
+                player.ChatMessage("/jail extend <playername/id> [minutes:optional] - Extend Jail Time\n");
                 return;
             }
 
@@ -707,15 +718,31 @@ namespace Oxide.Plugins
                     if (args.Length >= 2)
                     {
                         BasePlayer targetPlayer = FindPlayersSingle(args[1], player);
-                        if (targetPlayer == null)
+                        bool offline = false;
+                        ulong targetId = 0;
+                        if (targetPlayer == null || !targetPlayer.IsConnected)
                         {
-                            player.ChatMessage("Player not found.");
-                            return;
+
+                            if (targetPlayer.userID.IsSteamId() && !targetPlayer.IsConnected)
+                            {
+                                if (storedData.jailedPlayers.Any(jp => jp.playerId == targetId))
+                                {
+                                    player.ChatMessage("Player is already jailed.");
+                                    return;
+                                }
+
+                                offline = true;
+                            }
+                            else
+                            {
+                                player.ChatMessage("Player not found.");
+                                return;
+                            }
                         }
 
                         if (storedData.jailedPlayers.Any(jp => jp.playerId == targetPlayer.userID))
                         {
-                            player.ChatMessage("Player is already jailed, use /extendjail to extend time.");
+                            player.ChatMessage("Player is already jailed, use /jail extend to extend time.");
                             return;
                         }
 
@@ -735,11 +762,21 @@ namespace Oxide.Plugins
                             reason = reasons.ToString();
                         }
 
-                        SendToDiscordBot(targetPlayer, player, reason, jailTime.TotalMinutes.ToString());
-                        JailPlayer(targetPlayer, jailTime, reason);
-                        player.ChatMessage($"[<color=#FF4F4B>Jail</color>] You have sent {targetPlayer.displayName} to jail for {jailTime.TotalMinutes:F2} minutes because {reason}");
-                        PrintToChat($"[<color=#FF4F4B>Jail</color>] Player {targetPlayer.displayName} was sent to jail for {jailTime.TotalMinutes:F2} minutes because {reason}");
-                        Puts($"Player {targetPlayer.displayName} was sent to jail for {jailTime.TotalMinutes:F2} minutes because {reason} by {player.displayName}");
+                        if (offline)
+                        {
+                            JailOfflinePlayer(targetId, jailTime, reason);
+                            player.ChatMessage($"Offline player {targetId} has been jailed.");
+                            Puts($"Player {targetPlayer.name} was sent to jail for {jailTime.TotalMinutes:F2} minutes because {reason} by {player.displayName} while offline");
+                        }
+                        else
+                        {
+                            SendToDiscordBot(targetPlayer, player, reason, jailTime.TotalMinutes.ToString());
+                            JailPlayer(targetPlayer, jailTime, reason);
+                            player.ChatMessage($"[<color=#FF4F4B>Jail</color>] You have sent {targetPlayer.displayName} to jail for {jailTime.TotalMinutes:F2} minutes because {reason}");
+                            PrintToChat($"[<color=#FF4F4B>Jail</color>] Player {targetPlayer.displayName} was sent to jail for {jailTime.TotalMinutes:F2} minutes because {reason}");
+                            Puts($"Player {targetPlayer.displayName} was sent to jail for {jailTime.TotalMinutes:F2} minutes because {reason} by {player.displayName}");
+                        }
+
                     }
                     return;
 
@@ -767,7 +804,6 @@ namespace Oxide.Plugins
                 case "extend":
                     if (args.Length >= 2)
                     {
-                        Puts(args.Length.ToString());
                         int extraMinutes = int.MaxValue;
                         if (args.Length > 2)
                         {
@@ -803,7 +839,7 @@ namespace Oxide.Plugins
                             TimeSpan remainingTime = releaseTimes[jailedPlayer.userID] - DateTime.UtcNow;
                             string formattedTime = $"{remainingTime.Days}{remainingTime.Hours:D2}:{remainingTime.Minutes:D2}:{remainingTime.Seconds:D2}";
 
-                            jailedPlayersInfo.Add($"{jailedPlayer.displayName}: {formattedTime} remaining, Reason: {kvp.jailReason}");
+                            jailedPlayersInfo.Add($"<color=orange>{jailedPlayer.displayName}</color> - {formattedTime} remaining, Reason: {kvp.jailReason}");
                         }
                     }
 
@@ -835,9 +871,9 @@ namespace Oxide.Plugins
             if (arg.Args.Length < 1)
             {
                 SendReply(arg, "[<color=#FF4F4B>Jail</color>]\n");
-                SendReply(arg, "/jail send <playername/id> [minutes] [reason:optional] - Send to Jail\n");
-                SendReply(arg, "/jail free <playername/id> - Release from Jail\n");
-                SendReply(arg, "/jail extend <playername/id> [minutes] - Extend Jail Time\n");
+                SendReply(arg, "jail send <playername/id> [minutes:optional] [reason:optional] - Send to Jail\n");
+                SendReply(arg, "jail free <playername/id> - Release from Jail\n");
+                SendReply(arg, "jail extend <playername/id> [minutes:optional] - Extend Jail Time\n");
                 return;
             }
 
@@ -846,16 +882,32 @@ namespace Oxide.Plugins
                 case "send":
                     if (arg.Args.Length >= 2)
                     {
-                        BasePlayer targetPlayer = BasePlayer.Find(arg.Args[1]);
-                        if (targetPlayer == null)
+                        BasePlayer targetPlayer = FindPlayersSingleNull(arg.Args[1]);
+                        bool offline = false;
+                        ulong targetId = 0;
+                        if (targetPlayer == null || !targetPlayer.IsConnected)
                         {
-                            SendReply(arg, "Player not found.");
-                            return;
+
+                            if (targetPlayer.userID.IsSteamId() && !targetPlayer.IsConnected)
+                            {
+                                if (storedData.jailedPlayers.Any(jp => jp.playerId == targetId))
+                                {
+                                     SendReply(arg, "Player is already jailed.");
+                                    return;
+                                }
+
+                                offline = true;
+                            }
+                            else
+                            {
+                                 SendReply(arg, "Player not found.");
+                                return;
+                            }
                         }
 
                         if (storedData.jailedPlayers.Any(jp => jp.playerId == targetPlayer.userID))
                         {
-                            SendReply(arg, "Player is already jailed, use extend to extend time.");
+                            SendReply(arg, "Player is already jailed, use jail extend to extend time.");
                             return;
                         }
 
@@ -901,9 +953,10 @@ namespace Oxide.Plugins
                 case "extend":
                     if (arg.Args.Length >= 2)
                     {
-                        if (arg.Args.Length < 2 || !int.TryParse(arg.Args[2], out int extraMinutes))
+                        int extraMinutes = int.MaxValue;
+                        if (arg.Args.Length > 2)
                         {
-                            extraMinutes = int.MaxValue;
+                            extraMinutes = int.Parse(arg.Args[2]);
                         }
 
                         BasePlayer targetPlayer = BasePlayer.Find(arg.Args[1]);
@@ -933,7 +986,9 @@ namespace Oxide.Plugins
                         if (jailedPlayer != null && jailedPlayer.IsConnected)
                         {
                             TimeSpan remainingTime = kvp.releaseTime - DateTime.UtcNow;
-                            jailedPlayersInfo.Add($"{jailedPlayer.displayName}: {remainingTime.TotalMinutes:F2} minutes remaining, Reason: {kvp.jailReason}");
+                            string formattedTime = $"{remainingTime.Days}{remainingTime.Hours:D2}:{remainingTime.Minutes:D2}:{remainingTime.Seconds:D2}";
+
+                            jailedPlayersInfo.Add($"<color=orange>{jailedPlayer.displayName}</color> - {formattedTime} remaining, Reason: {kvp.jailReason}");
                         }
                     }
 
@@ -961,6 +1016,7 @@ namespace Oxide.Plugins
         #region Utility Methods
 
         private BasePlayer FindPlayersSingle(string value, BasePlayer player) => (BasePlayer)NTeleportation.Call("API_FindPlayer", value, player);
+        private BasePlayer FindPlayersSingleNull(string value) => (BasePlayer)NTeleportation.Call("API_FindPlayerNull", value);
 
         public void StartSleeping(BasePlayer player) // custom as to not cancel crafting, or remove player from vanish
         {
